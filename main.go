@@ -8,20 +8,24 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type Config struct {
-	Port    int
-	Workers int
-	Timeout time.Duration
-	File    string
-	Output  string
-	Verbose bool
-	Retries int
-	Quiet   bool
+	Port       int
+	Workers    int
+	Timeout    time.Duration
+	File       string
+	Output     string
+	Verbose    bool
+	Retries    int
+	Quiet      bool
+	TargetIP   string
+	TargetFile string
 }
 
 type Result struct {
@@ -83,6 +87,69 @@ func fileIsTerminal(file *os.File) bool {
 	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
+func normalizeIP(raw string) (string, error) {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return "", fmt.Errorf("invalid IP %q", raw)
+	}
+	return ip.String(), nil
+}
+
+func loadOverrideIPs(targetIP, targetFile string) ([]string, error) {
+	if targetIP != "" && targetFile != "" {
+		return nil, fmt.Errorf("cannot use -target and -target-file together")
+	}
+	if targetIP == "" && targetFile == "" {
+		return nil, nil
+	}
+
+	var ips []string
+	seen := make(map[string]struct{})
+	addIP := func(raw string) error {
+		ip, err := normalizeIP(raw)
+		if err != nil {
+			return err
+		}
+		if _, ok := seen[ip]; ok {
+			return nil
+		}
+		seen[ip] = struct{}{}
+		ips = append(ips, ip)
+		return nil
+	}
+
+	if targetIP != "" {
+		if err := addIP(targetIP); err != nil {
+			return nil, fmt.Errorf("invalid -target: %w", err)
+		}
+		return ips, nil
+	}
+
+	inFile, err := os.Open(targetFile)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open %s: %w", targetFile, err)
+	}
+	defer inFile.Close()
+
+	scanner := bufio.NewScanner(inFile)
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if err := addIP(line); err != nil {
+			return nil, fmt.Errorf("invalid IP in %s at line %d: %w", targetFile, lineNo, err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w", targetFile, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPs found in %s", targetFile)
+	}
+	return ips, nil
+}
+
 func resolveIPs(ctx context.Context, domain string, timeout time.Duration) ([]string, error) {
 	resolver := &net.Resolver{}
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -98,8 +165,15 @@ func resolveIPs(ctx context.Context, domain string, timeout time.Duration) ([]st
 	return addrs, nil
 }
 
-func probe(ctx context.Context, domain string, port int, timeout time.Duration, retries int) Result {
-	ips, err := resolveIPs(ctx, domain, timeout)
+func candidateIPs(ctx context.Context, domain string, timeout time.Duration, overrideIPs []string) ([]string, error) {
+	if len(overrideIPs) > 0 {
+		return overrideIPs, nil
+	}
+	return resolveIPs(ctx, domain, timeout)
+}
+
+func probe(ctx context.Context, domain string, port int, timeout time.Duration, retries int, overrideIPs []string) Result {
+	ips, err := candidateIPs(ctx, domain, timeout, overrideIPs)
 	if err != nil {
 		return Result{Domain: domain, IP: "?", Allowed: false, Error: err.Error()}
 	}
@@ -107,7 +181,7 @@ func probe(ctx context.Context, domain string, port int, timeout time.Duration, 
 	var lastErr error
 	lastIP := "?"
 	for _, ip := range ips {
-		addr := fmt.Sprintf("%s:%d", ip, port)
+		addr := net.JoinHostPort(ip, strconv.Itoa(port))
 		lastIP = ip
 
 		for i := 0; i <= retries; i++ {
@@ -172,11 +246,19 @@ func main() {
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "Also print blocked domains")
 	flag.IntVar(&cfg.Retries, "retries", 0, "Retries on failure")
 	flag.BoolVar(&cfg.Quiet, "q", false, "Quiet mode (hide start/end scan logs)")
+	flag.StringVar(&cfg.TargetIP, "target", "", "Override DNS and probe this IP for every domain")
+	flag.StringVar(&cfg.TargetFile, "target-file", "", "Override DNS and probe IPs from this file for every domain")
 	flag.Parse()
 
 	if cfg.File == "" {
 		logf(logColorize, "ERR", "usage: sniper -f domains.txt [options]")
 		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	overrideIPs, err := loadOverrideIPs(cfg.TargetIP, cfg.TargetFile)
+	if err != nil {
+		logf(logColorize, "ERR", "%v", err)
 		os.Exit(1)
 	}
 
@@ -251,7 +333,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for domain := range jobs {
-				r := probe(ctx, domain, cfg.Port, cfg.Timeout, cfg.Retries)
+				r := probe(ctx, domain, cfg.Port, cfg.Timeout, cfg.Retries, overrideIPs)
 
 				if r.Allowed {
 					allowed.Add(1)

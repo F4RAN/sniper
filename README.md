@@ -58,6 +58,18 @@ Write results to a file:
 sniper -f domains.txt -output results.txt
 ```
 
+Scan domains against one fixed IP:
+
+```bash
+sniper -f domains.txt -target 104.19.229.21
+```
+
+Scan domains against IPs loaded from a file:
+
+```bash
+sniper -f domains.txt -target-file ips.txt
+```
+
 ## Flags
 
 - `-f string` input file with domains, one per line
@@ -68,10 +80,13 @@ sniper -f domains.txt -output results.txt
 - `-verbose` print blocked domains too
 - `-retries int` retries per IP on failure, default `0`
 - `-q` hide start and completion logs
+- `-target string` override DNS and probe one IP for every domain
+- `-target-file string` override DNS and probe IPs from a file for every domain
 
 ## Notes
 
 - If a domain resolves to multiple IPs, `sniper` tries all of them.
+- If `-target` or `-target-file` is set, `sniper` skips DNS and uses those IPs instead.
 - A domain is `allowed` if any resolved IP completes the TLS handshake.
 - `-timeout` is per attempt, not a total cap for the whole domain.
 - Result lines go to stdout, or to the file passed with `-output`.
