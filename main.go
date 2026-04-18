@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/term"
 )
 
 type Config struct {
@@ -25,6 +27,7 @@ type Config struct {
 	Verbose    bool
 	Retries    int
 	Quiet      bool
+	Trace      bool
 	TargetIP   string
 	TargetFile string
 }
@@ -49,8 +52,10 @@ type Result struct {
 }
 
 var (
-	allowed atomic.Int64
-	failed  atomic.Int64
+	allowed    atomic.Int64
+	failed     atomic.Int64
+	doneProbes atomic.Int64
+	queuedJobs atomic.Int64
 )
 
 func logf(colorize bool, level string, format string, args ...any) {
@@ -360,6 +365,79 @@ func formatGroupedLine(domain string, probePorts []int, perPort map[int]portOutc
 	return fmt.Sprintf("%-30s %-18s %s  %s", domain, ip, latStr, b.String())
 }
 
+// formatTraceProbeLine matches formatGroupedLine columns for a single completed probe (stderr stream).
+func formatTraceProbeLine(domain string, port int, r Result, colorize bool) string {
+	ip := r.IP
+	if ip == "" {
+		ip = "?"
+	}
+	latStr := "-"
+	if r.Allowed {
+		latStr = formatLatency(r.Latency.Milliseconds(), colorize)
+	}
+	portMark := fmt.Sprintf("%d %s", port, formatMark(r.Allowed, colorize))
+	return fmt.Sprintf("%-30s %-18s %s  %s", domain, ip, latStr, portMark)
+}
+
+func formatProgressBar(done, total int64, width int) string {
+	if total <= 0 || width <= 0 {
+		return "[]"
+	}
+	if done > total {
+		done = total
+	}
+	filled := int(float64(width) * float64(done) / float64(total))
+	if filled > width {
+		filled = width
+	}
+	var b strings.Builder
+	b.Grow(width + 2)
+	b.WriteByte('[')
+	for i := 0; i < width; i++ {
+		if i < filled {
+			b.WriteByte('=')
+		} else {
+			b.WriteByte(' ')
+		}
+	}
+	b.WriteByte(']')
+	return b.String()
+}
+
+// paintProgressLineInner draws the progress bar. With useStickyRow and a valid terminal size, it is
+// painted on the bottom row so trace lines can scroll above. Caller must hold stderrMu.
+func paintProgressLineInner(useStickyRow bool) {
+	n := doneProbes.Load()
+	denom := queuedJobs.Load()
+	if denom == 0 {
+		denom = 1
+	}
+	bar := formatProgressBar(n, denom, 20)
+	if useStickyRow {
+		if _, h, err := term.GetSize(int(os.Stderr.Fd())); err == nil && h > 0 {
+			// ESC 7 / ESC 8 (DECSC/DECRC): \033[s / \033[u break on many macOS terminals.
+			fmt.Fprint(os.Stderr, "\0337")
+			fmt.Fprintf(os.Stderr, "\033[%d;1H\033[K%s %d/%d", h, bar, n, denom)
+			fmt.Fprint(os.Stderr, "\0338")
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "\r\033[K%s %d/%d", bar, n, denom)
+}
+
+// clearProgressLineInner clears the progress bar line (sticky bottom or CR line). Caller must hold stderrMu.
+func clearProgressLineInner(useStickyRow bool) {
+	if useStickyRow {
+		if _, h, err := term.GetSize(int(os.Stderr.Fd())); err == nil && h > 0 {
+			fmt.Fprint(os.Stderr, "\0337")
+			fmt.Fprintf(os.Stderr, "\033[%d;1H\033[K", h)
+			fmt.Fprint(os.Stderr, "\0338")
+			return
+		}
+	}
+	fmt.Fprint(os.Stderr, "\r\033[K")
+}
+
 func main() {
 	cfg := Config{}
 	logColorize := fileIsTerminal(os.Stderr)
@@ -371,7 +449,8 @@ func main() {
 	flag.StringVar(&cfg.Output, "output", "", "Save results to file (default: stdout)")
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "Include domains where every port failed (hidden by default)")
 	flag.IntVar(&cfg.Retries, "retries", 0, "Retries on failure")
-	flag.BoolVar(&cfg.Quiet, "q", false, "Quiet mode (hide start/end scan logs)")
+	flag.BoolVar(&cfg.Quiet, "q", false, "Quiet mode (hide start/end scan logs and progress)")
+	flag.BoolVar(&cfg.Trace, "trace", false, "Stream each finished probe to stderr (same columns as results)")
 	flag.StringVar(&cfg.TargetIP, "target", "", "Override DNS and probe this IP for every domain")
 	flag.StringVar(&cfg.TargetFile, "target-file", "", "Override DNS and probe IPs from this file for every domain")
 	flag.Parse()
@@ -462,6 +541,50 @@ func main() {
 		logf(logColorize, "INFO", "starting workers=%d timeout=%s", cfg.Workers, cfg.Timeout)
 	}
 
+	doneProbes.Store(0)
+	queuedJobs.Store(0)
+
+	stderrTTY := fileIsTerminal(os.Stderr)
+	useStickyFooter := stderrTTY
+	var stderrMu sync.Mutex
+
+	// Rows 1..h-1 scroll; row h is reserved for the progress footer so traces never share that line.
+	var resetScrollRegion func()
+	if useStickyFooter && !cfg.Quiet {
+		if _, h, err := term.GetSize(int(os.Stderr.Fd())); err == nil && h > 2 {
+			fmt.Fprintf(os.Stderr, "\033[1;%dr", h-1)
+			resetScrollRegion = func() { fmt.Fprint(os.Stderr, "\033[r") }
+		}
+	}
+
+	stopProgress := make(chan struct{})
+	if !cfg.Quiet {
+		go func() {
+			ticker := time.NewTicker(150 * time.Millisecond)
+			defer ticker.Stop()
+			var lastN, lastD int64 = -1, -1
+			for {
+				select {
+				case <-stopProgress:
+					return
+				case <-ticker.C:
+					n := doneProbes.Load()
+					denom := queuedJobs.Load()
+					if denom == 0 {
+						denom = 1
+					}
+					if !stderrTTY && n == lastN && denom == lastD {
+						continue
+					}
+					lastN, lastD = n, denom
+					stderrMu.Lock()
+					paintProgressLineInner(useStickyFooter)
+					stderrMu.Unlock()
+				}
+			}
+		}()
+	}
+
 	for i := 0; i < cfg.Workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -487,6 +610,14 @@ func main() {
 					IP:      r.IP,
 				}
 				aggMu.Unlock()
+
+				doneProbes.Add(1)
+
+				if cfg.Trace {
+					stderrMu.Lock()
+					fmt.Fprintln(os.Stderr, formatTraceProbeLine(job.Domain, job.Port, r, outputColorize))
+					stderrMu.Unlock()
+				}
 			}
 		}()
 	}
@@ -507,11 +638,23 @@ func main() {
 		total += int64(len(ports))
 		for _, port := range ports {
 			jobs <- Job{Domain: domain, Port: port}
+			queuedJobs.Add(1)
 		}
 	}
 	scanErr := scanner.Err()
 	close(jobs)
+
 	wg.Wait()
+	close(stopProgress)
+	if !cfg.Quiet && total > 0 && stderrTTY {
+		stderrMu.Lock()
+		clearProgressLineInner(useStickyFooter)
+		stderrMu.Unlock()
+	}
+	if resetScrollRegion != nil {
+		resetScrollRegion()
+		resetScrollRegion = nil
+	}
 
 	for _, domain := range domainOrder {
 		line := formatGroupedLine(domain, ports, aggregated[domain], outputColorize, cfg.Verbose)
@@ -525,6 +668,9 @@ func main() {
 
 	if scanErr != nil {
 		cleanupOutput()
+		if resetScrollRegion != nil {
+			resetScrollRegion()
+		}
 		logf(logColorize, "ERR", "cannot read %s: %v", cfg.File, scanErr)
 		os.Exit(1)
 	}
