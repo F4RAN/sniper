@@ -96,6 +96,120 @@ func formatLatency(latencyMs int64, colorize bool) string {
 	}
 }
 
+var cdnRanges []struct {
+	name string
+	net  *net.IPNet
+}
+
+func init() {
+	specs := []struct{ name, cidr string }{
+		// Cloudflare
+		{"Cloudflare", "173.245.48.0/20"},
+		{"Cloudflare", "103.21.244.0/22"},
+		{"Cloudflare", "103.22.200.0/22"},
+		{"Cloudflare", "103.31.4.0/22"},
+		{"Cloudflare", "104.16.0.0/13"},
+		{"Cloudflare", "104.24.0.0/14"},
+		{"Cloudflare", "108.162.192.0/18"},
+		{"Cloudflare", "131.0.72.0/22"},
+		{"Cloudflare", "141.101.64.0/18"},
+		{"Cloudflare", "162.158.0.0/15"},
+		{"Cloudflare", "172.64.0.0/13"},
+		{"Cloudflare", "188.114.96.0/20"},
+		{"Cloudflare", "190.93.240.0/20"},
+		{"Cloudflare", "197.234.240.0/22"},
+		{"Cloudflare", "198.41.128.0/17"},
+		// Fastly
+		{"Fastly", "23.235.32.0/20"},
+		{"Fastly", "43.249.72.0/22"},
+		{"Fastly", "103.244.50.0/24"},
+		{"Fastly", "103.245.222.0/23"},
+		{"Fastly", "103.245.224.0/24"},
+		{"Fastly", "104.156.80.0/20"},
+		{"Fastly", "140.248.64.0/18"},
+		{"Fastly", "140.248.128.0/17"},
+		{"Fastly", "146.75.0.0/17"},
+		{"Fastly", "151.101.0.0/16"},
+		{"Fastly", "157.52.64.0/18"},
+		{"Fastly", "167.82.0.0/17"},
+		{"Fastly", "167.82.128.0/20"},
+		{"Fastly", "167.82.160.0/20"},
+		{"Fastly", "167.82.224.0/20"},
+		{"Fastly", "172.111.64.0/18"},
+		{"Fastly", "185.31.16.0/22"},
+		{"Fastly", "199.27.72.0/21"},
+		{"Fastly", "199.232.0.0/16"},
+		// AWS CloudFront
+		{"CloudFront", "13.32.0.0/15"},
+		{"CloudFront", "13.35.0.0/16"},
+		{"CloudFront", "13.224.0.0/14"},
+		{"CloudFront", "52.84.0.0/15"},
+		{"CloudFront", "54.182.0.0/16"},
+		{"CloudFront", "54.192.0.0/16"},
+		{"CloudFront", "54.230.0.0/16"},
+		{"CloudFront", "54.239.128.0/18"},
+		{"CloudFront", "64.252.64.0/18"},
+		{"CloudFront", "70.132.0.0/18"},
+		{"CloudFront", "99.84.0.0/16"},
+		{"CloudFront", "143.204.0.0/16"},
+		{"CloudFront", "204.246.164.0/22"},
+		{"CloudFront", "204.246.168.0/22"},
+		{"CloudFront", "205.251.192.0/19"},
+		{"CloudFront", "216.137.32.0/19"},
+		// Akamai
+		{"Akamai", "23.32.0.0/11"},
+		{"Akamai", "23.64.0.0/14"},
+		{"Akamai", "23.192.0.0/11"},
+		{"Akamai", "96.6.0.0/15"},
+		{"Akamai", "96.16.0.0/15"},
+		{"Akamai", "104.64.0.0/10"},
+		// Google
+		{"Google", "8.8.8.0/24"},
+		{"Google", "8.8.4.0/24"},
+		{"Google", "66.102.0.0/20"},
+		{"Google", "66.249.64.0/19"},
+		{"Google", "72.14.192.0/18"},
+		{"Google", "74.125.0.0/16"},
+		{"Google", "108.177.8.0/21"},
+		{"Google", "108.177.96.0/19"},
+		{"Google", "130.211.0.0/22"},
+		{"Google", "172.217.0.0/16"},
+		{"Google", "172.253.0.0/17"},
+		{"Google", "173.194.0.0/16"},
+		{"Google", "209.85.128.0/17"},
+		{"Google", "216.58.192.0/19"},
+		{"Google", "216.239.32.0/19"},
+		// Incapsula / Imperva
+		{"Incapsula", "45.64.64.0/22"},
+		{"Incapsula", "149.126.72.0/21"},
+		{"Incapsula", "192.230.64.0/18"},
+		{"Incapsula", "199.83.128.0/21"},
+		{"Incapsula", "198.143.32.0/21"},
+	}
+	for _, s := range specs {
+		_, ipNet, err := net.ParseCIDR(s.cidr)
+		if err == nil {
+			cdnRanges = append(cdnRanges, struct {
+				name string
+				net  *net.IPNet
+			}{s.name, ipNet})
+		}
+	}
+}
+
+func detectCDN(ipStr string) string {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return "-"
+	}
+	for _, e := range cdnRanges {
+		if e.net.Contains(ip) {
+			return e.name
+		}
+	}
+	return "-"
+}
+
 func fileIsTerminal(file *os.File) bool {
 	info, err := file.Stat()
 	if err != nil {
@@ -352,6 +466,8 @@ func formatGroupedLine(domain string, probePorts []int, perPort map[int]portOutc
 		latStr = formatLatency(maxLat.Milliseconds(), colorize)
 	}
 
+	cdn := detectCDN(ip)
+
 	var b strings.Builder
 	for i, p := range probePorts {
 		if i > 0 {
@@ -362,7 +478,7 @@ func formatGroupedLine(domain string, probePorts []int, perPort map[int]portOutc
 		fmt.Fprintf(&b, "%d %s", p, formatMark(allowed, colorize))
 	}
 
-	return fmt.Sprintf("%-30s %-18s %s  %s", domain, ip, latStr, b.String())
+	return fmt.Sprintf("%-30s %-18s %-12s %s  %s", domain, ip, cdn, latStr, b.String())
 }
 
 // formatTraceProbeLine matches formatGroupedLine columns for a single completed probe (stderr stream).
@@ -375,8 +491,9 @@ func formatTraceProbeLine(domain string, port int, r Result, colorize bool) stri
 	if r.Allowed {
 		latStr = formatLatency(r.Latency.Milliseconds(), colorize)
 	}
+	cdn := detectCDN(ip)
 	portMark := fmt.Sprintf("%d %s", port, formatMark(r.Allowed, colorize))
-	return fmt.Sprintf("%-30s %-18s %s  %s", domain, ip, latStr, portMark)
+	return fmt.Sprintf("%-30s %-18s %-12s %s  %s", domain, ip, cdn, latStr, portMark)
 }
 
 func formatProgressBar(done, total int64, width int) string {
