@@ -1,49 +1,66 @@
 # Sniper
 
-Check whether a domain can complete a TLS handshake from your current network using its real SNI.
+`sniper` checks whether a domain can complete a TLS handshake from your network.
 
 `sniper` resolves the domain, tries every returned IP for each configured port, and considers a port **allowed** when one IP completes TLS on that port.
 
 ## Quick Start
 
-Build:
+Check one domain:
 
 ```bash
-go build -o sniper .
+sniper google.com
 ```
 
-Create an input file with one domain per line:
+Check many domains from a file:
+
+```bash
+sniper -f domains.txt
+```
+
+Example `domains.txt`:
 
 ```text
-hcaptcha.com
 google.com
+hcaptcha.com
 letsencrypt.org
 ```
 
-Run:
+Show blocked domains too:
 
 ```bash
-sniper -f domains.txt
+sniper -f domains.txt -verbose
 ```
 
-See full help:
+## What The Result Means
 
-```bash
-sniper -h
+Example:
+
+```text
+google.com                     142.250.185.46     210ms allowed
 ```
 
-## Important Examples
+This means:
 
-Scan a file:
+- `google.com` is the domain you tested
+- `142.250.185.46` is the IP that worked
+- `210ms` is how long it took
+- `allowed` means the TCP connection and TLS handshake worked
+
+If it says `blocked`, the TCP connection or TLS handshake did not work.
+
+## Common Examples
+
+Check one domain with a shorter timeout:
 
 ```bash
-sniper -f domains.txt
+sniper google.com -timeout 1s
 ```
 
-Probe a different TLS port:
+Save results to a file:
 
 ```bash
-sniper -f domains.txt -port 8443
+sniper -f domains.txt -output results.txt
 ```
 
 Probe several ports at once (comma-separated; overrides `-port` when set):
@@ -55,28 +72,43 @@ sniper -f domains.txt -ports 443,2053,8443
 Use a shorter timeout:
 
 ```bash
-sniper -f domains.txt -timeout 1s
+sniper google.com -target 1.1.1.1
 ```
 
-Write results to a file:
+Check a list of domains on one specific IP:
 
 ```bash
-sniper -f domains.txt -output results.txt
+sniper -f domains.txt -target 1.1.1.1
 ```
 
-Scan domains against one fixed IP:
-
-```bash
-sniper -f domains.txt -target 104.19.229.21
-```
-
-Scan domains against IPs loaded from a file:
+Check a list of domains on many IPs from a file:
 
 ```bash
 sniper -f domains.txt -target-file ips.txt
 ```
 
-## Flags
+Use a different HTTPS port:
+
+```bash
+sniper google.com -port 8443
+```
+
+## Main Flags
+
+- `sniper google.com`
+  Check one domain directly
+
+- `-f domains.txt`
+  Check many domains from a file
+
+- `-verbose`
+  Also print blocked domains
+
+- `-timeout 1s`
+  Change how long sniper waits before giving up
+
+- `-output results.txt`
+  Save result lines to a file
 
 - `-f string` input file with domains, one per line
 - `-port int` TLS port when `-ports` is not set, default `443`

@@ -218,15 +218,111 @@ func fileIsTerminal(file *os.File) bool {
 	return (info.Mode() & os.ModeCharDevice) != 0
 }
 
-func normalizeIP(raw string) (string, error) {
-	ip := net.ParseIP(strings.TrimSpace(raw))
-	if ip == nil {
-		return "", fmt.Errorf("invalid IP %q", raw)
-	}
-	return ip.String(), nil
+func printUsage(colorize bool) {
+	logf(colorize, "ERR", "usage: sniper -f domains.txt [options]")
+	logf(colorize, "ERR", "   or: sniper domain [options]")
+	flag.PrintDefaults()
 }
 
-func loadOverrideIPs(targetIP, targetFile string) ([]string, error) {
+func splitCLIArgs(args []string) ([]string, []string) {
+	valueFlags := map[string]struct{}{
+		"f":           {},
+		"port":        {},
+		"workers":     {},
+		"timeout":     {},
+		"output":      {},
+		"retries":     {},
+		"target":      {},
+		"target-file": {},
+	}
+	boolFlags := map[string]struct{}{
+		"verbose": {},
+		"ipv6":    {},
+		"q":       {},
+		"h":       {},
+		"help":    {},
+	}
+
+	var flagArgs []string
+	var positional []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if arg == "-" || !strings.HasPrefix(arg, "-") {
+			positional = append(positional, arg)
+			continue
+		}
+
+		flagArgs = append(flagArgs, arg)
+		if strings.Contains(arg, "=") {
+			continue
+		}
+
+		name := strings.TrimLeft(arg, "-")
+		if _, ok := boolFlags[name]; ok {
+			continue
+		}
+		if _, ok := valueFlags[name]; ok {
+			if i+1 < len(args) {
+				i++
+				flagArgs = append(flagArgs, args[i])
+			}
+			continue
+		}
+
+		// Preserve a following non-flag token for unknown flags so it does not get
+		// misclassified as positional input before flag parsing reports the error.
+		if i+1 < len(args) {
+			next := args[i+1]
+			if next == "-" || !strings.HasPrefix(next, "-") {
+				i++
+				flagArgs = append(flagArgs, next)
+			}
+		}
+	}
+
+	return flagArgs, positional
+}
+
+func normalizeIP(raw string) (net.IP, error) {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return nil, fmt.Errorf("invalid IP %q", raw)
+	}
+	return ip, nil
+}
+
+func enqueueDomains(jobs chan<- string, filePath, singleDomain string) (int64, error) {
+	if singleDomain != "" {
+		jobs <- singleDomain
+		return 1, nil
+	}
+
+	inFile, err := os.Open(filePath)
+	if err != nil {
+		return 0, fmt.Errorf("cannot open %s: %w", filePath, err)
+	}
+	defer inFile.Close()
+
+	var total int64
+	scanner := bufio.NewScanner(inFile)
+	for scanner.Scan() {
+		if domain := strings.TrimSpace(scanner.Text()); domain != "" {
+			total++
+			jobs <- domain
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return total, fmt.Errorf("cannot read %s: %w", filePath, err)
+	}
+	return total, nil
+}
+
+func loadOverrideIPs(targetIP, targetFile string) ([]net.IP, error) {
 	if targetIP != "" && targetFile != "" {
 		return nil, fmt.Errorf("cannot use -target and -target-file together")
 	}
@@ -234,17 +330,18 @@ func loadOverrideIPs(targetIP, targetFile string) ([]string, error) {
 		return nil, nil
 	}
 
-	var ips []string
+	var ips []net.IP
 	seen := make(map[string]struct{})
 	addIP := func(raw string) error {
 		ip, err := normalizeIP(raw)
 		if err != nil {
 			return err
 		}
-		if _, ok := seen[ip]; ok {
+		ipStr := ip.String()
+		if _, ok := seen[ipStr]; ok {
 			return nil
 		}
-		seen[ip] = struct{}{}
+		seen[ipStr] = struct{}{}
 		ips = append(ips, ip)
 		return nil
 	}
@@ -323,25 +420,31 @@ func resolveIPs(ctx context.Context, domain string, timeout time.Duration) ([]st
 	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	addrs, err := resolver.LookupHost(lookupCtx, domain)
+	network := "ip4"
+	if includeIPv6 {
+		network = "ip"
+	}
+
+	addrs, err := resolver.LookupIP(lookupCtx, network, domain)
 	if err != nil {
 		return nil, fmt.Errorf("dns failed: %w", err)
 	}
+
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("dns failed: no addresses returned")
 	}
 	return addrs, nil
 }
 
-func candidateIPs(ctx context.Context, domain string, timeout time.Duration, overrideIPs []string) ([]string, error) {
+func candidateIPs(ctx context.Context, domain string, timeout time.Duration, includeIPv6 bool, overrideIPs []net.IP) ([]net.IP, error) {
 	if len(overrideIPs) > 0 {
 		return overrideIPs, nil
 	}
-	return resolveIPs(ctx, domain, timeout)
+	return resolveIPs(ctx, domain, timeout, includeIPv6)
 }
 
-func probe(ctx context.Context, domain string, port int, timeout time.Duration, retries int, overrideIPs []string) Result {
-	ips, err := candidateIPs(ctx, domain, timeout, overrideIPs)
+func probe(ctx context.Context, domain string, port int, timeout time.Duration, retries int, includeIPv6 bool, overrideIPs []net.IP) Result {
+	ips, err := candidateIPs(ctx, domain, timeout, includeIPv6, overrideIPs)
 	if err != nil {
 		return Result{Domain: domain, IP: "?", Allowed: false, Error: err.Error()}
 	}
@@ -349,8 +452,9 @@ func probe(ctx context.Context, domain string, port int, timeout time.Duration, 
 	var lastErr error
 	lastIP := "?"
 	for _, ip := range ips {
-		addr := net.JoinHostPort(ip, strconv.Itoa(port))
-		lastIP = ip
+		ipStr := ip.String()
+		addr := net.JoinHostPort(ipStr, strconv.Itoa(port))
+		lastIP = ipStr
 
 		for i := 0; i <= retries; i++ {
 			if ctx.Err() != nil {
@@ -386,7 +490,7 @@ func probe(ctx context.Context, domain string, port int, timeout time.Duration, 
 			tlsConn.Close()
 
 			if err == nil {
-				return Result{Domain: domain, IP: ip, Allowed: true, Latency: time.Since(start)}
+				return Result{Domain: domain, IP: ipStr, Allowed: true, Latency: time.Since(start)}
 			}
 
 			lastErr = err
@@ -570,11 +674,11 @@ func main() {
 	flag.BoolVar(&cfg.Trace, "trace", false, "Stream each finished probe to stderr (same columns as results)")
 	flag.StringVar(&cfg.TargetIP, "target", "", "Override DNS and probe this IP for every domain")
 	flag.StringVar(&cfg.TargetFile, "target-file", "", "Override DNS and probe IPs from this file for every domain")
-	flag.Parse()
+	flagArgs, positionalDomains := splitCLIArgs(os.Args[1:])
+	flag.CommandLine.Parse(flagArgs)
 
-	if cfg.File == "" {
-		logf(logColorize, "ERR", "usage: sniper -f domains.txt [options]")
-		flag.PrintDefaults()
+	if len(positionalDomains) > 1 {
+		logf(logColorize, "ERR", "only one positional domain is supported")
 		os.Exit(1)
 	}
 
@@ -590,12 +694,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	inFile, err := os.Open(cfg.File)
+	overrideIPs, err := loadOverrideIPs(cfg.TargetIP, cfg.TargetFile)
 	if err != nil {
-		logf(logColorize, "ERR", "cannot open %s: %v", cfg.File, err)
+		logf(logColorize, "ERR", "%v", err)
 		os.Exit(1)
 	}
-	defer inFile.Close()
 
 	outWriter := bufio.NewWriter(os.Stdout)
 	outputFile := os.Stdout
